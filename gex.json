@@ -1,0 +1,6 @@
+[
+  {
+    "name": "installer",
+    "main": "installer/main.js"
+  }
+]
