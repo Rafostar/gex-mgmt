@@ -7,6 +7,7 @@ const APP_NAME = 'Gex Installer';
 const DATA_DIR = GLib.get_user_data_dir();
 const INSTALL_DIR = DATA_DIR + '/gex';
 const PREFIX_DIR = DATA_DIR.slice(0, DATA_DIR.lastIndexOf('/'));
+const LIB_DIR = PREFIX_DIR + '/lib';
 const BIN_PATH = PREFIX_DIR + '/bin/gex';
 const GEX_SRC = 'https://raw.githubusercontent.com/Rafostar/gex/master';
 
@@ -39,15 +40,8 @@ class Downloader
         return new Promise((resolve, reject) => {
             let file;
 
-            if(savePath) {
-                file = Gio.file_new_for_path(savePath);
-
-                if(!file.query_exists(null)) {
-                    let dir = file.get_parent();
-                    if(!dir.query_exists(null))
-                        dir.make_directory_with_parents(null);
-                }
-            }
+            if(savePath)
+                file = this._prepareFile(savePath);
 
             let data = '';
             let message = Soup.Message.new('GET', link);
@@ -77,6 +71,19 @@ class Downloader
                     .catch(err => reject(err));
             });
         });
+    }
+
+    _prepareFile(savePath)
+    {
+        let file = Gio.file_new_for_path(savePath);
+
+        if(!file.query_exists(null)) {
+            let dir = file.get_parent();
+            if(!dir.query_exists(null))
+                dir.make_directory_with_parents(null);
+        }
+
+        return file;
     }
 
     _saveFile(data, file)
@@ -175,6 +182,33 @@ class Installer
             let progressValue = (progress < 0.99) ? progress : 1;
             this.progressBar.set_fraction(progressValue);
         }
+
+        await this.createBinary().catch(err => this._onInstallError(err));
+    }
+
+    createBinary()
+    {
+        let data = [
+            `#!/usr/bin/gjs`,
+            ``,
+            `imports.package.init({`,
+            `  name: "gex",`,
+            `  prefix: "${PREFIX_DIR}",`,
+            `  libdir: "${LIB_DIR}",`,
+            `  datadir: "${DATA_DIR}",`,
+            `});`,
+            `imports.package.run(imports.main);`
+        ].join('\n');
+
+        return new Promise((resolve, reject) => {
+            let file = this.downloader._prepareFile(BIN_PATH);
+            this.downloader._saveFile(data, file)
+                .then(() => {
+                    let proc = Gio.Subprocess.new(['chmod', '+x', BIN_PATH], Gio.SubprocessFlags.NONE);
+                    proc.wait_async(null, () => resolve());
+                })
+                .catch(err => reject(err));
+        });
     }
 
     getLabel(text, size)
