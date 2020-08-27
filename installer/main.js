@@ -1,19 +1,19 @@
 imports.gi.versions.Gtk = '3.0';
 
 const { Gio, GLib, Gtk, Soup } = imports.gi;
+const ByteArray = imports.byteArray;
 
 const APP_NAME = 'Gex Installer';
 const DATA_DIR = GLib.get_user_data_dir();
 const INSTALL_DIR = DATA_DIR + '/gex';
 const PREFIX_DIR = DATA_DIR.slice(0, DATA_DIR.lastIndexOf('/'));
 const BIN_PATH = PREFIX_DIR + '/bin/gex';
+const GEX_SRC = 'https://raw.githubusercontent.com/Rafostar/gex/master';
 
 class Downloader
 {
     constructor()
     {
-        this.totalDownloads = 0;
-
         this.session = new Soup.Session({
             user_agent: 'gex_installer',
             timeout: 5,
@@ -28,7 +28,7 @@ class Downloader
         while(retries--) {
             let res = await this._downloadFile(link, savePath).catch(logError);
             if(res)
-                return;
+                return res;
         }
 
         throw new Error('download retries exceeded');
@@ -37,25 +37,40 @@ class Downloader
     _downloadFile(link, savePath)
     {
         return new Promise((resolve, reject) => {
-            let file = Gio.file_new_for_path(savePath);
+            let file;
 
-            if(!file.query_exists(null)) {
-                let dir = file.get_parent();
-                if(!dir.query_exists(null))
-                    dir.make_directory_with_parents(null);
+            if(savePath) {
+                file = Gio.file_new_for_path(savePath);
+
+                if(!file.query_exists(null)) {
+                    let dir = file.get_parent();
+                    if(!dir.query_exists(null))
+                        dir.make_directory_with_parents(null);
+                }
             }
 
             let data = '';
             let message = Soup.Message.new('GET', link);
 
             message.connect('got_chunk', (self, chunk) => {
-                data += chunk.get_data();
+                let chunkData = chunk.get_data();
+                data += (chunkData instanceof Uint8Array)
+                    ? ByteArray.toString(chunkData)
+                    : chunkData;
             });
             this.session.queue_message(message, () => {
                 if(message.status_code !== 200) {
                     return reject(
                         new Error(`response code: ${message.status_code}`)
                     );
+                }
+                if(!savePath) {
+                    let json = null;
+
+                    try { json = JSON.parse(data) }
+                    catch(err) { reject(err) }
+
+                    return resolve(json);
                 }
                 this._saveFile(data, file)
                     .then(() => resolve(true))
@@ -99,6 +114,8 @@ class Installer
     {
         GLib.set_prgname(APP_NAME);
 
+        this.installStarted = false;
+
         this.application = new Gtk.Application();
         this.application.connect('activate', () => this._openDialog());
         this.application.connect('startup', () => this._buildUI());
@@ -107,11 +124,12 @@ class Installer
 
     _buildUI()
     {
-        this.assistant = new Gtk.Assistant();
+        this.assistant = new Gtk.Assistant({ use_header_bar: true });
         this.assistant.window_position = Gtk.WindowPosition.CENTER;
 
         this.assistant.connect('close', () => Gtk.main_quit());
         this.assistant.connect('cancel', () => Gtk.main_quit());
+        this.assistant.connect('prepare', this._onPagePrepare.bind(this));
 
         this.downloader = new Downloader();
     }
@@ -121,7 +139,7 @@ class Installer
         this.assistant.set_size_request(720, 520);
         this.assistant.set_title(APP_NAME);
 
-        let index = 1;
+        let index = 0;
         while(true) {
             if(typeof this[`_getPage${index}`] !== 'function')
                 break;
@@ -139,17 +157,91 @@ class Installer
         Gtk.main();
     }
 
+    async installGex()
+    {
+        let json = await this.downloader.downloadFile(
+            `${GEX_SRC}/gex.json`
+        ).catch(err => this._onInstallError(err));
+
+        let progress = 0;
+        let fraction = 1 / json.files.length;
+
+        for(let file of json.files) {
+            await this.downloader.downloadFile(
+                `${GEX_SRC}/${file}`,
+                `${INSTALL_DIR}/${file}`
+            ).catch(err => this._onInstallError(err));
+            progress += fraction;
+            let progressValue = (progress < 0.99) ? progress : 1;
+            this.progressBar.set_fraction(progressValue);
+        }
+    }
+
     getLabel(text, size)
     {
-        size = size || 12;
-
         return new Gtk.Label({
-            label: `<span font="${size}"><b>` + text + '</b></span>',
+            label: this.getMarkupText(text, size),
             use_markup: true
         });
     }
 
-    addConfigToGrid(grid, text, value)
+    getMarkupText(text, size)
+    {
+        return `<span font="${size || 12}"><b>` + text + '</b></span>';
+    }
+
+    _getPage0()
+    {
+        let label = this.getLabel(`Welcome to the ${APP_NAME}`, 14);
+
+        return [label, 'Introduction', 'INTRO'];
+    }
+
+    _getPage1()
+    {
+        let grid = new Gtk.Grid({
+            halign:Gtk.Align.CENTER,
+            valign:Gtk.Align.CENTER,
+            row_spacing: 8,
+            column_spacing: 8
+        });
+
+        let label = this.getLabel(`Gex will be installed to these directories`);
+        label.margin_bottom = 8;
+        grid.attach(label, 0, 0, 2, 1);
+
+        this.configRow = 1;
+        this._addConfigToGrid(grid, 'Install Path', INSTALL_DIR);
+        this._addConfigToGrid(grid, 'Binary Path', BIN_PATH);
+
+        return [grid, 'Info', 'CONTENT'];
+    }
+
+    _getPage2()
+    {
+        let grid = new Gtk.Grid({
+            halign:Gtk.Align.CENTER,
+            valign:Gtk.Align.CENTER
+        });
+        this.progressLabel = this.getLabel('Installing...');
+        this.progressBar = new Gtk.ProgressBar({
+            width_request: 420
+        });
+
+        grid.attach(this.progressLabel, 0, 0, 1, 1);
+        grid.attach(this.progressBar, 0, 1, 1, 1);
+
+        return [grid, 'Installation', 'PROGRESS'];
+    }
+
+    _getPage3()
+    {
+        let label = this.getLabel('Gex was successfully installed');
+
+        return [label, 'Finish', 'SUMMARY'];
+    }
+
+    _addConfigToGrid(grid, text, value)
     {
         let label = new Gtk.Label({ label: text });
         let entry = new Gtk.Entry({
@@ -164,56 +256,25 @@ class Installer
         this.configRow++;
     }
 
-    _getPage1()
+    _onPagePrepare(assistant, page, ss)
     {
-        let label = this.getLabel(`Welcome to the ${APP_NAME}`, 14);
+        if(
+            this.assistant.get_page_type(page) !== Gtk.AssistantPageType.PROGRESS
+            || this.installStarted
+        )
+            return;
 
-        return [label, 'Introduction', 'INTRO'];
+        this.installStarted = true;
+        this.installGex().then(() => {
+            this.progressLabel.label = this.getMarkupText('Installed');
+            this.assistant.set_page_complete(page, true);
+        });
     }
 
-    _getPage2()
+    _onInstallError(err)
     {
-        let grid = new Gtk.Grid({
-            halign:Gtk.Align.CENTER,
-            valign:Gtk.Align.CENTER,
-            row_spacing: 8,
-            column_spacing: 8
-        });
-
-        let label = this.getLabel(`Gex will be installed to these directories`);
-        label.margin_bottom = 8;
-        grid.attach(label, 0, 0, 2, 1);
-
-        this.configRow = 1;
-        this.addConfigToGrid(grid, 'Prefix Path', PREFIX_DIR);
-        this.addConfigToGrid(grid, 'Install Path', INSTALL_DIR);
-        this.addConfigToGrid(grid, 'Binary Path', BIN_PATH);
-
-        return [grid, 'Info', 'CONTENT'];
-    }
-
-    _getPage3()
-    {
-        let grid = new Gtk.Grid({
-            halign:Gtk.Align.CENTER,
-            valign:Gtk.Align.CENTER
-        });
-        let label = this.getLabel('Installing...');
-        let progress = new Gtk.LevelBar({
-            width_request: 420
-        });
-
-        grid.attach(label, 0, 0, 1, 1);
-        grid.attach(progress, 0, 1, 1, 1);
-
-        return [grid, 'Installation', 'PROGRESS'];
-    }
-
-    _getPage4()
-    {
-        let label = this.getLabel('Gex was successfully installed');
-
-        return [label, 'Finish', 'SUMMARY'];
+        logError(err);
+        Gtk.main_quit();
     }
 }
 
